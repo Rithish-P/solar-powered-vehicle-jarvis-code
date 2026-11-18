@@ -1,0 +1,472 @@
+import socket
+import threading
+import queue
+import time
+import re
+import difflib
+import tkinter as tk
+from datetime import datetime
+
+import speech_recognition as sr
+
+# ================= CONFIG =================
+ESP_IP = "192.168.137.58"
+ESP_PORT = 333
+
+# Un original code-la left -> RIGHT, right -> LEFT nu swap pannirundha.
+# Motor wiring reverse na idha True-nu vachuko. Illa na False.
+SWAP_LEFT_RIGHT = True
+
+# Voice la left/right sonna, itha neram (seconds) thirumbitu appuram forward pogum.
+# Angle kammi na increase pannu, adhigam na kammi pannu.
+TURN_TIME = 0.5
+
+# Voice speed settings.
+# PAUSE = command sonna apuram evvalavu neram silence irundha "mudinjuduchu" nu eduthukkum.
+# Kammi pannina fast. Words cut aana (ex: "forwa") 0.6 or 0.7 ku increase pannu.
+VOICE_PAUSE = 0.6
+VOICE_PHRASE_LIMIT = 2
+
+# Voice la sila words thappa purinjikkum (ex: "lift" for left). Adha handle panna:
+VOICE_LANGUAGE = "en-IN"   # Indian English accent ku better
+ALIASES = {
+    "stop": "STOP", "stopped": "STOP", "stops": "STOP", "halt": "STOP", "top": "STOP",
+    "forward": "FORWARD", "forwards": "FORWARD", "for": "FOR" , "For": "ahead", "FORWARD": "straight", "FORWARD": "go", "FORWARD":
+    "backward", "BACKWARD": "backwards", "BACKWARD": "back", "BACKWARD": "reverse", "BACKWARD":
+    "left", "LEFT": "lift", "LEFT":
+    "right", "RIGHT": "write", "RIGHT": "rite", "RIGHT": "Write,"
+}
+KEYWORDS = ["forward", "backward", "left", "right", "stop"]
+
+# ================= THEME =================
+BG = "#0d1117"
+PANEL = "#161b22"
+PANEL_2 = "#1f2630"
+BORDER = "#30363d"
+TEXT = "#e6edf3"
+MUTED = "#8b949e"
+ACCENT = "#2f81f7"
+GREEN = "#3fb950"
+RED = "#f85149"
+AMBER = "#d29922"
+
+FONT = "Segoe UI"
+
+
+class JarvisApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("JARVIS Control Dashboard")
+        self.root.geometry("920x600")
+        self.root.configure(bg=BG)
+        self.root.minsize(820, 560)
+
+        self.ui_queue = queue.Queue()
+        self.voice_thread = None
+        self.voice_stop = threading.Event()
+        self.voice_on = False
+        self.connected = False
+        self.cmd_count = 0
+        self.current_cmd = "STOP"
+        self.held_keys = set()
+        self.seq = 0  # latest command number, used to cancel pending forward
+
+        self.build_ui()
+        self.bind_keys()
+
+        threading.Thread(target=self.connection_monitor, daemon=True).start()
+        self.root.after(100, self.process_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------------- UI ----------------
+    def build_ui(self):
+        # Header
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(fill="x", padx=20, pady=(16, 8))
+
+        tk.Label(header, text="JARVIS", font=(FONT, 22, "bold"),
+                 fg=TEXT, bg=BG).pack(side="left")
+        tk.Label(header, text="  Robot Control Dashboard", font=(FONT, 12),
+                 fg=MUTED, bg=BG).pack(side="left", pady=(8, 0))
+
+        self.conn_label = tk.Label(header, text="OFFLINE", font=(FONT, 10, "bold"),
+                                   fg=RED, bg=BG)
+        self.conn_label.pack(side="right")
+        self.conn_dot = tk.Canvas(header, width=14, height=14, bg=BG,
+                                  highlightthickness=0)
+        self.conn_dot.pack(side="right", padx=(0, 6))
+        self.dot_item = self.conn_dot.create_oval(2, 2, 12, 12, fill=RED, outline="")
+
+        # Body
+        body = tk.Frame(self.root, bg=BG)
+        body.pack(fill="both", expand=True, padx=20, pady=8)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        # ---- Left: Manual control ----
+        left = self.card(body, "MANUAL CONTROL")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        pad = tk.Frame(left, bg=PANEL)
+        pad.pack(expand=True)
+
+        self.btn_fwd = self.dir_button(pad, "▲", "FORWARD")
+        self.btn_left = self.dir_button(pad, "◀", "LEFT")
+        self.btn_stop = self.dir_button(pad, "■", "STOP", color=RED)
+        self.btn_right = self.dir_button(pad, "▶", "RIGHT")
+        self.btn_back = self.dir_button(pad, "▼", "BACKWARD")
+
+        self.btn_fwd.grid(row=0, column=1, padx=6, pady=6)
+        self.btn_left.grid(row=1, column=0, padx=6, pady=6)
+        self.btn_stop.grid(row=1, column=1, padx=6, pady=6)
+        self.btn_right.grid(row=1, column=2, padx=6, pady=6)
+        self.btn_back.grid(row=2, column=1, padx=6, pady=6)
+
+        tk.Label(left, text="Hold button / Arrow keys = move  •  Release / Space = stop",
+                 font=(FONT, 9), fg=MUTED, bg=PANEL).pack(pady=(0, 12))
+
+        # ---- Right: Status + Voice ----
+        right = tk.Frame(body, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right.rowconfigure(2, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        # Status card
+        status = self.card(right, "STATUS")
+        status.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        row = tk.Frame(status, bg=PANEL)
+        row.pack(fill="x", padx=16, pady=(0, 12))
+        self.stat_cmd = self.stat_block(row, "CURRENT COMMAND", "STOP")
+        self.stat_cmd.pack(side="left", expand=True, fill="x")
+        self.stat_count = self.stat_block(row, "COMMANDS SENT", "0")
+        self.stat_count.pack(side="left", expand=True, fill="x")
+        self.stat_ip = self.stat_block(row, "ESP32", f"{ESP_IP}:{ESP_PORT}")
+        self.stat_ip.pack(side="left", expand=True, fill="x")
+
+        # Voice card
+        voice = self.card(right, "VOICE CONTROL")
+        voice.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        vrow = tk.Frame(voice, bg=PANEL)
+        vrow.pack(fill="x", padx=16, pady=(0, 6))
+
+        self.voice_btn = tk.Button(vrow, text="🎤  START LISTENING",
+                                   font=(FONT, 11, "bold"), fg="white", bg=ACCENT,
+                                   activebackground="#1f6feb", activeforeground="white",
+                                   relief="flat", bd=0, padx=16, pady=10,
+                                   cursor="hand2", command=self.toggle_voice)
+        self.voice_btn.pack(side="left")
+
+        self.voice_status = tk.Label(vrow, text="Voice off", font=(FONT, 10),
+                                     fg=MUTED, bg=PANEL)
+        self.voice_status.pack(side="left", padx=14)
+
+        self.heard_label = tk.Label(voice, text="—", font=(FONT, 14, "bold"),
+                                    fg=TEXT, bg=PANEL, anchor="w")
+        self.heard_label.pack(fill="x", padx=16)
+        tk.Label(voice, text="Say: forward, backward, left, right, stop  •  'exit' to stop voice",
+                 font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w").pack(fill="x", padx=16, pady=(2, 12))
+
+        # Log card
+        logcard = self.card(right, "ACTIVITY LOG")
+        logcard.grid(row=2, column=0, sticky="nsew")
+        logwrap = tk.Frame(logcard, bg=PANEL)
+        logwrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.log = tk.Text(logwrap, bg=PANEL_2, fg=TEXT, font=("Consolas", 10),
+                           relief="flat", bd=0, padx=10, pady=8, wrap="word",
+                           state="disabled", height=8)
+        sb = tk.Scrollbar(logwrap, command=self.log.yview)
+        self.log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.log.tag_config("time", foreground=MUTED)
+        self.log.tag_config("sent", foreground=GREEN)
+        self.log.tag_config("heard", foreground=ACCENT)
+        self.log.tag_config("warn", foreground=AMBER)
+        self.log.tag_config("err", foreground=RED)
+
+        self.add_log("Dashboard ready.", "warn")
+
+    def card(self, parent, title):
+        frame = tk.Frame(parent, bg=PANEL, highlightbackground=BORDER,
+                         highlightthickness=1)
+        tk.Label(frame, text=title, font=(FONT, 9, "bold"), fg=MUTED,
+                 bg=PANEL).pack(anchor="w", padx=16, pady=(12, 8))
+        return frame
+
+    def stat_block(self, parent, label, value):
+        f = tk.Frame(parent, bg=PANEL)
+        tk.Label(f, text=label, font=(FONT, 8, "bold"), fg=MUTED,
+                 bg=PANEL, anchor="w").pack(fill="x")
+        v = tk.Label(f, text=value, font=(FONT, 13, "bold"), fg=TEXT,
+                     bg=PANEL, anchor="w")
+        v.pack(fill="x")
+        f.value = v
+        return f
+
+    def dir_button(self, parent, symbol, cmd, color=ACCENT):
+        b = tk.Button(parent, text=symbol, font=(FONT, 22, "bold"), width=3, height=1,
+                      fg="white", bg=PANEL_2, activebackground=color,
+                      activeforeground="white", relief="flat", bd=0,
+                      highlightbackground=BORDER, highlightthickness=1,
+                      cursor="hand2")
+        b.bind("<ButtonPress-1>", lambda e: self.press(cmd, b, color))
+        if cmd != "STOP":
+            b.bind("<ButtonRelease-1>", lambda e: self.release(b))
+        else:
+            b.bind("<ButtonRelease-1>", lambda e: b.configure(bg=PANEL_2))
+        return b
+
+    # ---------------- Manual control ----------------
+    def press(self, cmd, btn=None, color=ACCENT):
+        if btn:
+            btn.configure(bg=color)
+        self.send_async(cmd, "manual")
+
+    def release(self, btn):
+        btn.configure(bg=PANEL_2)
+        self.send_async("STOP", "manual")
+
+    def bind_keys(self):
+        keymap = {
+            "Up": ("FORWARD", lambda: self.btn_fwd),
+            "Down": ("BACKWARD", lambda: self.btn_back),
+            "Left": ("LEFT", lambda: self.btn_left),
+            "Right": ("RIGHT", lambda: self.btn_right),
+        }
+        for key, (cmd, getbtn) in keymap.items():
+            self.root.bind(f"<KeyPress-{key}>",
+                           lambda e, k=key, c=cmd, g=getbtn: self.key_down(k, c, g()))
+            self.root.bind(f"<KeyRelease-{key}>",
+                           lambda e, k=key, g=getbtn: self.key_up(k, g()))
+        self.root.bind("<space>", lambda e: self.send_async("STOP", "key"))
+
+    def key_down(self, key, cmd, btn):
+        if key in self.held_keys:  # ignore auto-repeat
+            return
+        self.held_keys.add(key)
+        btn.configure(bg=ACCENT)
+        self.send_async(cmd, "key")
+
+    def key_up(self, key, btn):
+        self.held_keys.discard(key)
+        btn.configure(bg=PANEL_2)
+        self.send_async("STOP", "key")
+
+    # ---------------- Networking ----------------
+    def send_async(self, cmd, source="manual"):
+        # every new command cancels any pending "turn then forward"
+        self.seq += 1
+        threading.Thread(target=self._send, args=(cmd, source), daemon=True).start()
+
+    def _send(self, cmd, source):
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(3)
+        try:
+            client.connect((ESP_IP, ESP_PORT))
+            client.sendall((cmd + "\n").encode())
+            self.ui_queue.put(("sent", cmd, source))
+        except Exception as e:
+            self.ui_queue.put(("log", f"Connection error: {e}", "err"))
+        finally:
+            client.close()
+
+    def connection_monitor(self):
+        while True:
+            ok = False
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            try:
+                s.connect((ESP_IP, ESP_PORT))
+                ok = True
+            except Exception:
+                ok = False
+            finally:
+                s.close()
+            self.ui_queue.put(("conn", ok))
+            time.sleep(3)
+
+    # ---------------- Voice ----------------
+    def toggle_voice(self):
+        if self.voice_on:
+            self.stop_voice()
+        else:
+            self.start_voice()
+
+    def start_voice(self):
+        self.voice_on = True
+        self.voice_stop.clear()
+        self.voice_btn.configure(text="⏹  STOP LISTENING", bg=RED,
+                                 activebackground="#da3633")
+        self.voice_status.configure(text="Calibrating mic...", fg=AMBER)
+        self.voice_thread = threading.Thread(target=self.voice_loop, daemon=True)
+        self.voice_thread.start()
+
+    def stop_voice(self):
+        self.voice_on = False
+        self.voice_stop.set()
+        self.voice_btn.configure(text="🎤  START LISTENING", bg=ACCENT,
+                                 activebackground="#1f6feb")
+        self.voice_status.configure(text="Voice off", fg=MUTED)
+
+    def get_command(self, text):
+        text = text.lower()
+        words = re.findall(r"[a-z]+", text)
+        compact = "".join(words)
+        found = set()
+        for w in words:
+            if w in ALIASES:
+                found.add(ALIASES[w])
+            else:
+                m = difflib.get_close_matches(w, KEYWORDS, n=1, cutoff=0.8)
+                if m:
+                    found.add(ALIASES[m[0]])
+        if "forward" in compact:
+            found.add("FORWARD")
+        if "backward" in compact:
+            found.add("BACKWARD")
+
+        # Priority: STOP first (safety), then turns, then backward, then forward
+        for cmd in ("STOP", "LEFT", "RIGHT", "BACKWARD", "FORWARD"):
+            if cmd in found:
+                break
+        else:
+            return None
+
+        if SWAP_LEFT_RIGHT:
+            if cmd == "LEFT":
+                return "RIGHT"
+            if cmd == "RIGHT":
+                return "LEFT"
+        return cmd
+
+    def turn_then_forward(self, cmd):
+        # Turn for TURN_TIME seconds, then go forward.
+        # If any newer command comes in the meantime (like STOP), skip the forward.
+        self.seq += 1
+        my_seq = self.seq
+        self._send(cmd, "voice")
+        time.sleep(TURN_TIME)
+        if my_seq == self.seq:
+            self._send("FORWARD", "voice")
+
+    def voice_loop(self):
+        recognizer = sr.Recognizer()
+        recognizer.pause_threshold = VOICE_PAUSE
+        recognizer.non_speaking_duration = min(0.3, VOICE_PAUSE)
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                self.ui_queue.put(("voice_status", "Listening...", GREEN))
+                while not self.voice_stop.is_set():
+                    try:
+                        audio = recognizer.listen(source, timeout=2, phrase_time_limit=VOICE_PHRASE_LIMIT)
+                    except sr.WaitTimeoutError:
+                        continue
+                    if self.voice_stop.is_set():
+                        break
+                    self.ui_queue.put(("voice_status", "Processing...", AMBER))
+                    try:
+                        result = recognizer.recognize_google(
+                            audio, language=VOICE_LANGUAGE, show_all=True)
+                        alternatives = []
+                        if isinstance(result, dict):
+                            alternatives = [a.get("transcript", "")
+                                            for a in result.get("alternative", [])]
+                        if not alternatives:
+                            raise sr.UnknownValueError()
+                        text = alternatives[0]
+                        self.ui_queue.put(("heard", text))
+
+                        if "exit" in text.lower():
+                            self.seq += 1
+                            self._send("STOP", "voice")
+                            self.ui_queue.put(("voice_exit",))
+                            return
+
+                        cmd = None
+                        for alt in alternatives:
+                            cmd = self.get_command(alt)
+                            if cmd:
+                                break
+                        if cmd in ("LEFT", "RIGHT"):
+                            threading.Thread(target=self.turn_then_forward,
+                                             args=(cmd,), daemon=True).start()
+                        elif cmd:
+                            self.seq += 1
+                            self._send(cmd, "voice")
+                        else:
+                            self.ui_queue.put(("log", "Command purila, ignore panren", "warn"))
+                    except sr.UnknownValueError:
+                        self.ui_queue.put(("log", "Purila, thirumba sollu", "warn"))
+                    except sr.RequestError as e:
+                        self.ui_queue.put(("log", f"Internet error: {e}", "err"))
+                    self.ui_queue.put(("voice_status", "Listening...", GREEN))
+        except Exception as e:
+            self.ui_queue.put(("log", f"Mic error: {e}", "err"))
+            self.ui_queue.put(("voice_exit",))
+
+    # ---------------- UI updates ----------------
+    def process_queue(self):
+        try:
+            while True:
+                item = self.ui_queue.get_nowait()
+                kind = item[0]
+                if kind == "sent":
+                    _, cmd, source = item
+                    self.cmd_count += 1
+                    self.current_cmd = cmd
+                    self.stat_cmd.value.configure(
+                        text=cmd, fg=RED if cmd == "STOP" else GREEN)
+                    self.stat_count.value.configure(text=str(self.cmd_count))
+                    self.add_log(f"SENT  {cmd}  ({source})", "sent")
+                elif kind == "log":
+                    self.add_log(item[1], item[2])
+                elif kind == "heard":
+                    self.heard_label.configure(text=f"“{item[1]}”")
+                    self.add_log(f"HEARD {item[1]}", "heard")
+                elif kind == "conn":
+                    self.set_connected(item[1])
+                elif kind == "voice_status":
+                    if self.voice_on:
+                        self.voice_status.configure(text=item[1], fg=item[2])
+                elif kind == "voice_exit":
+                    self.stop_voice()
+                    self.add_log("Voice stopped.", "warn")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_queue)
+
+    def set_connected(self, ok):
+        if ok != self.connected:
+            self.add_log("ESP32 online" if ok else "ESP32 offline",
+                         "sent" if ok else "err")
+        self.connected = ok
+        color = GREEN if ok else RED
+        self.conn_dot.itemconfig(self.dot_item, fill=color)
+        self.conn_label.configure(text="ONLINE" if ok else "OFFLINE", fg=color)
+
+    def add_log(self, msg, tag="warn"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log.configure(state="normal")
+        self.log.insert("end", f"[{ts}] ", "time")
+        self.log.insert("end", msg + "\n", tag)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def on_close(self):
+        self.voice_stop.set()
+        try:
+            self._send("STOP", "exit")
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    JarvisApp(root)
+    root.mainloop()
